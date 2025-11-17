@@ -1,0 +1,575 @@
+//+------------------------------------------------------------------+
+//|                                              ChronosEA_XAU_Pro   |
+//|           XAUUSD Time Vortex + Adaptive Risk Management         |
+//|               Single Trade with Time Interval Analysis          |
+//+------------------------------------------------------------------+
+#property copyright "CHRONOS - Time Vortex XAUUSD"
+#property version   "5.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Arrays\ArrayLong.mqh>
+
+//--- XAUUSD Configuration
+input string   TradingSymbol       = "XAUUSD";
+input int      HistoryBars         = 2000;
+input int      SwingPeriod         = 3;
+input double   BaseLotSize         = 0.01;
+input int      AnalysisInterval    = 5;
+input bool     EnableTrading       = true;
+input bool     EnableAlerts        = true;
+input double   MaxRiskPercent      = 1.0;
+
+//--- Time Vortex Parameters
+input int      Fibonacci_Sequence_Length = 144;
+input int      Historical_Swing_Points = 500;
+input double   Golden_Ratio = 1.6180339887;
+
+//--- Trading Discipline
+input bool     SingleTradeMode     = true;
+input int      MinBarsBetweenTrades= 3;
+input double   MaxDrawdownPercent  = 2.0;
+input int      MaxTradesPerHour    = 6;
+input bool     UseSentimentExits   = true;
+input double   SentimentExitThreshold = -2.0;
+
+//--- Adaptive Risk Management
+input bool     Use_Dynamic_RR = true;
+input double   Min_Acceptable_RR = 0.8;
+input bool     Use_Signal_Override = true;
+input int      Max_Trade_Duration = 240;
+
+//--- Global Variables
+CTrade         trade;
+ulong          currentTicket = 0;
+string         currentDirection = "";
+datetime       lastTradeTime = 0;
+int            tradesThisHour = 0;
+datetime       hourStartTime = 0;
+double         sessionStartBalance = 0;
+bool           tradingEnabled = true;
+
+//--- Time Vortex Variables
+MqlRates       rates[];
+long           fibSequence[];
+double         dailyRiskUsed = 0.0;
+double         initialEquity = 0.0;
+datetime       lastRiskReset = 0;
+
+//--- PZS Zone Variables
+struct PZS_Zone
+{
+   double low;
+   double high;
+   double strength;
+   datetime created;
+};
+
+PZS_Zone PZS_zones[8];
+int      PZS_zoneCount = 0;
+double   PZS_zone_merge_pct = 0.0025;
+double   PZS_zone_padding_pct = 0.0012;
+int      PZS_max_zones = 5;
+int      PZS_lookback_bars = 200;
+int      PZS_time_start_min = 0;
+int      PZS_time_end_min   = 59;
+double   PZS_min_confluence = 0.60;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    trade.SetExpertMagicNumber(2024);
+    trade.SetDeviationInPoints(20);
+    EventSetTimer(AnalysisInterval);
+    
+    sessionStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    hourStartTime = TimeCurrent();
+    
+    // Initialize Time Vortex
+    GenerateFibonacciVortexSequence();
+    InitializeRiskManagement();
+    
+    Print("=== XAUUSD TIME VORTEX TRADER INITIALIZED ===");
+    Print("Single Trade Mode: ACTIVE");
+    Print("Time Vortex Analysis: ENABLED");
+    Print("Dynamic Risk-Reward: ", Use_Dynamic_RR);
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    EventKillTimer();
+    // Clean up chart objects
+    ObjectsDeleteAll(0, "Chronos_");
+    ObjectsDeleteAll(0, "PZS_");
+    Print("XAUUSD Time Vortex Trader Stopped");
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - Main control loop                               |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    // Check hourly reset
+    if(TimeCurrent() - hourStartTime >= 3600)
+    {
+        tradesThisHour = 0;
+        hourStartTime = TimeCurrent();
+    }
+    
+    // Check drawdown limits
+    if(!CheckDrawdownLimits())
+    {
+        if(tradingEnabled)
+        {
+            tradingEnabled = false;
+            Print("!!! TRADING DISABLED - Max drawdown reached !!!");
+        }
+        return;
+    }
+    
+    // Load current data
+    if(CopyRates(TradingSymbol, PERIOD_M1, 0, 100, rates) < 100)
+        return;
+    
+    CheckDailyReset();
+    
+    // Calculate Time Vortex metrics
+    datetime currentTime = TimeCurrent();
+    double vortexMomentum = CalculateVortexMomentum(currentTime);
+    double timeHarmonic = CalculateTimeHarmonic(currentTime);
+    double confluence = CalculateVortexConfluence(currentTime);
+    
+    // Generate time-based signal
+    int newSignal = GeneratePureTimeSignal(currentTime, vortexMomentum, timeHarmonic);
+
+    // Musical harmonic analysis on last 5 swings
+    AnalyzeMusicalHarmonicsLast5(rates);
+
+    // Update PZS zones and try PZS entries/reversals
+    PZS_UpdateZones();
+    PZS_TryEntry(newSignal, confluence);
+
+    // Manage existing trade
+    if(currentTicket > 0)
+    {
+        if(!ManageExistingTrade(newSignal, confluence))
+        {
+            currentTicket = 0;
+            currentDirection = "";
+        }
+    }
+    
+    // Check for new trade opportunity (legacy fallback if PZS didn't open)
+    if(tradingEnabled && currentTicket == 0 && tradesThisHour < MaxTradesPerHour)
+    {
+        if(confluence > 0.7 && newSignal != 0 && CheckRiskLimits())
+        {
+            if(ConfirmTimeVortexSignal(newSignal, confluence))
+            {
+                ExecuteAdaptiveTrade(newSignal, confluence);
+                lastTradeTime = TimeCurrent();
+                tradesThisHour++;
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Generate Fibonacci Vortex Sequence                              |
+//+------------------------------------------------------------------+
+void GenerateFibonacciVortexSequence()
+{
+    ArrayResize(fibSequence, Fibonacci_Sequence_Length);
+    
+    if(Fibonacci_Sequence_Length >= 1)
+        fibSequence[0] = 1;
+    if(Fibonacci_Sequence_Length >= 2)
+        fibSequence[1] = 1;
+    
+    for(int i = 2; i < Fibonacci_Sequence_Length; i++)
+    {
+        fibSequence[i] = fibSequence[i-1] + fibSequence[i-2];
+    }
+    
+    Print("Fibonacci Vortex Sequence Generated: ", Fibonacci_Sequence_Length, " elements");
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Vortex Momentum based on time cycles                 |
+//+------------------------------------------------------------------+
+double CalculateVortexMomentum(datetime currentTime)
+{
+    long currentMinute = currentTime / 60; // Convert to minutes
+    
+    double momentum = 0;
+    int activeCycles = 0;
+    
+    for(int i = 0; i < Fibonacci_Sequence_Length; i++)
+    {
+        if(fibSequence[i] == 0) continue;
+        
+        // Check if current time aligns with Fibonacci cycle
+        if(currentMinute % fibSequence[i] == 0)
+        {
+            momentum += 1.0 / (i + 1); // Weight by sequence position
+            activeCycles++;
+        }
+    }
+    
+    if(activeCycles > 0)
+        momentum /= activeCycles;
+    
+    return momentum;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Time Harmonic                                        |
+//+------------------------------------------------------------------+
+double CalculateTimeHarmonic(datetime currentTime)
+{
+    MqlDateTime timeStruct;
+    TimeToStruct(currentTime, timeStruct);
+    
+    // Calculate harmonic based on time of day and Fibonacci alignment
+    double harmonic = 0;
+    
+    // Minute harmonic (0-59 cycle)
+    harmonic += MathSin(2 * M_PI * timeStruct.min / 60.0) * 0.3;
+    
+    // Hour harmonic (0-23 cycle)  
+    harmonic += MathCos(2 * M_PI * timeStruct.hour / 24.0) * 0.4;
+    
+    // Fibonacci time harmonic
+    long totalMinutes = timeStruct.hour * 60 + timeStruct.min;
+    for(int i = 0; i < MathMin(10, Fibonacci_Sequence_Length); i++)
+    {
+        if(fibSequence[i] > 0)
+        {
+            harmonic += MathSin(2 * M_PI * totalMinutes / fibSequence[i]) * 0.1;
+        }
+    }
+    
+    return harmonic;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Vortex Confluence                                    |
+//+------------------------------------------------------------------+
+double CalculateVortexConfluence(datetime currentTime)
+{
+    double momentum = CalculateVortexMomentum(currentTime);
+    double harmonic = CalculateTimeHarmonic(currentTime);
+    
+    // Combine momentum and harmonic with Golden Ratio weighting
+    double confluence = (momentum * Golden_Ratio + harmonic) / (1 + Golden_Ratio);
+    
+    // Add price action confirmation
+    double priceConfirmation = CalculatePriceActionConfidence();
+    confluence = (confluence * 0.7 + priceConfirmation * 0.3);
+    
+    return MathMin(confluence, 1.0);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Price Action Confidence                              |
+//+------------------------------------------------------------------+
+double CalculatePriceActionConfidence()
+{
+    if(ArraySize(rates) < 10) return 0.5;
+    
+    // Simple price action analysis
+    double sumRange = 0;
+    int count = 0;
+    
+    for(int i = 1; i < MathMin(10, ArraySize(rates)); i++)
+    {
+        double range = (rates[i].high - rates[i].low) / rates[i].close;
+        sumRange += range;
+        count++;
+    }
+    
+    double avgRange = sumRange / count;
+    
+    // Normalize to 0-1 range (assuming typical XAUUSD ranges)
+    double confidence = MathMin(avgRange / 0.002, 1.0);
+    
+    return confidence;
+}
+
+//+------------------------------------------------------------------+
+//| Generate Pure Time Signal                                      |
+//+------------------------------------------------------------------+
+int GeneratePureTimeSignal(datetime currentTime, double vortexMomentum, double timeHarmonic)
+{
+    // Use time cycles to generate directional bias
+    long currentMinute = currentTime / 60;
+    
+    int buySignals = 0;
+    int sellSignals = 0;
+    
+    // Check Fibonacci time cycles for directional bias
+    for(int i = 0; i < MathMin(20, Fibonacci_Sequence_Length); i++)
+    {
+        if(fibSequence[i] > 5) // Avoid very short cycles
+        {
+            long cyclePosition = currentMinute % fibSequence[i];
+            
+            // Buy bias in first half of cycle, sell bias in second half
+            if(cyclePosition < fibSequence[i] / 2)
+                buySignals++;
+            else
+                sellSignals++;
+        }
+    }
+    
+    // Use time harmonic for additional bias
+    if(timeHarmonic > 0.2)
+        buySignals++;
+    else if(timeHarmonic < -0.2)
+        sellSignals++;
+    
+    if(buySignals > sellSignals + 2)
+        return 1; // BUY
+    else if(sellSignals > buySignals + 2)  
+        return -1; // SELL
+    else
+        return 0; // HOLD
+}
+
+//+------------------------------------------------------------------+
+//| Confirm Time Vortex Signal                                     |
+//+------------------------------------------------------------------+
+bool ConfirmTimeVortexSignal(int signal, double confluence)
+{
+    // Additional confirmation using price action
+    if(ArraySize(rates) < 5) return false;
+    
+    // Check if we're at a swing point
+    bool atSwing = IsAtSwingPoint(rates, ArraySize(rates)-1);
+    
+    // Check volatility
+    double volatility = CalculateVolatility(rates);
+    bool goodVolatility = (volatility >= 0.0003 && volatility <= 0.004);
+    
+    // Check time of day
+    MqlDateTime currentTime;
+    TimeToStruct(TimeCurrent(), currentTime);
+    bool goodTradingTime = (currentTime.hour >= 7 && currentTime.hour <= 16) || 
+                          (currentTime.hour >= 19 && currentTime.hour <= 23);
+    
+    Print(StringFormat("Signal Confirmation - Confluence: %.3f, Swing: %s, Vol: %.6f, GoodTime: %s", 
+          confluence, atSwing ? "YES" : "NO", volatility, goodTradingTime ? "YES" : "NO"));
+    
+    return atSwing && goodVolatility && goodTradingTime && confluence > 0.6;
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing trade with Time Vortex integration             |
+//+------------------------------------------------------------------+
+bool ManageExistingTrade(int newSignal, double newConfluence)
+{
+    if(!PositionSelectByTicket(currentTicket))
+    {
+        Print("Position not found, ticket: ", currentTicket);
+        return false;
+    }
+    
+    double currentProfit = PositionGetDouble(POSITION_PROFIT);
+    string posType = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL";
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+    datetime positionTime = (datetime)PositionGetInteger(POSITION_TIME);
+    
+    // 1. Time-based exit
+    if(TimeCurrent() - positionTime > (Max_Trade_Duration * 60))
+    {
+        ClosePositionWithReason(currentTicket, "Max Duration Reached", currentProfit);
+        return false;
+    }
+    
+    // 2. Signal override with Time Vortex confirmation
+    if(Use_Signal_Override && newConfluence > 0.8)
+    {
+        if((posType == "BUY" && newSignal == -1) ||
+           (posType == "SELL" && newSignal == 1))
+        {
+            ClosePositionWithReason(currentTicket, "Time Vortex Signal Override", currentProfit);
+            return false;
+        }
+    }
+    
+    // 3. Wrong trade detection using Time Vortex
+    if(IsWrongTrade(posType, openPrice, currentPrice, positionTime))
+    {
+        ClosePositionWithReason(currentTicket, "Wrong Trade Detection", currentProfit);
+        return false;
+    }
+    
+    // 4. Vortex momentum collapse exit
+    double currentConfluence = CalculateVortexConfluence(TimeCurrent());
+    if(currentConfluence < 0.4 && currentProfit < 0)
+    {
+        ClosePositionWithReason(currentTicket, "Vortex Momentum Collapse", currentProfit);
+        return false;
+    }
+    
+    // 5. Adaptive trailing stop for profitable positions
+    if(currentProfit > 0)
+    {
+        ManageTrailingStop(currentTicket, posType, openPrice, currentPrice, currentProfit);
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check drawdown limits                                          |
+//+------------------------------------------------------------------+
+bool CheckDrawdownLimits()
+{
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double drawdownPercent = ((sessionStartBalance - currentBalance) / sessionStartBalance) * 100.0;
+    
+    if(drawdownPercent >= MaxDrawdownPercent)
+    {
+        Print("Drawdown Limit Hit: ", DoubleToString(drawdownPercent, 2), "%");
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if trade is wrong using Time Vortex analysis             |
+//+------------------------------------------------------------------+
+bool IsWrongTrade(string posType, double openPrice, double currentPrice, datetime entryTime)
+{
+    double priceMove = MathAbs(currentPrice - openPrice) / openPrice;
+    double timeSinceEntry = (TimeCurrent() - entryTime) / 60.0;
+    
+    // Rapid adverse movement detection
+    if(timeSinceEntry < 10)
+    {
+        double adverseMove = (posType == "BUY") ? (openPrice - currentPrice) : (currentPrice - openPrice);
+        if(adverseMove > 0 && adverseMove / openPrice > 0.0015)
+        {
+            return true;
+        }
+    }
+    
+    // Vortex momentum check
+    double currentMomentum = CalculateVortexMomentum(TimeCurrent());
+    if(currentMomentum < 0.2 && priceMove > 0.003)
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Manage adaptive trailing stop                                  |
+//+------------------------------------------------------------------+
+void ManageTrailingStop(ulong ticket, string posType, double openPrice, double currentPrice, double currentProfit)
+{
+    double currentStop = PositionGetDouble(POSITION_SL);
+    double newStop = CalculateAdaptiveTrailingStop(ticket, posType, openPrice, currentPrice, currentProfit);
+    
+    if((posType == "BUY" && newStop > currentStop) ||
+       (posType == "SELL" && newStop < currentStop))
+    {
+        trade.PositionModify(ticket, newStop, PositionGetDouble(POSITION_TP));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate adaptive trailing stop                               |
+//+------------------------------------------------------------------+
+double CalculateAdaptiveTrailingStop(ulong ticket, string posType, double openPrice, double currentPrice, double currentProfit)
+{
+    double initialStop = GetPositionInitialStop(ticket);
+    double riskAmount = MathAbs(openPrice - initialStop);
+    double profitRatio = currentProfit / (riskAmount * PositionGetDouble(POSITION_VOLUME) * 100000);
+    
+    // Dynamic trailing based on profit and Time Vortex confluence
+    double currentConfluence = CalculateVortexConfluence(TimeCurrent());
+    
+    if(profitRatio >= 2.0)
+    {
+        // Strong profit - aggressive trailing
+        if(posType == "BUY")
+            return openPrice + (riskAmount * 0.6);
+        else
+            return openPrice - (riskAmount * 0.6);
+    }
+    else if(profitRatio >= 1.0)
+    {
+        // Good profit - moderate trailing
+        if(posType == "BUY")
+            return openPrice + (riskAmount * 0.3);
+        else
+            return openPrice - (riskAmount * 0.3);
+    }
+    else if(profitRatio >= 0.5 && currentConfluence > 0.6)
+    {
+        // Some profit with good confluence - light trailing
+        if(posType == "BUY")
+            return currentPrice - (riskAmount * 0.7);
+        else
+            return currentPrice + (riskAmount * 0.7);
+    }
+    
+    return initialStop;
+}
+
+//+------------------------------------------------------------------+
+//| Execute adaptive trade with Time Vortex parameters             |
+//+------------------------------------------------------------------+
+void ExecuteAdaptiveTrade(int direction, double confluence)
+{
+    double entryPrice = (direction == 1) ? SymbolInfoDouble(TradingSymbol, SYMBOL_ASK) 
+                                         : SymbolInfoDouble(TradingSymbol, SYMBOL_BID);
+    
+    // Adaptive position sizing based on confluence
+    double lotSize = CalculateAdaptivePositionSize(entryPrice, direction, confluence);
+    if(lotSize <= 0) return;
+    
+    // Dynamic stop loss calculation
+    double stopLoss = CalculateDynamicStopLoss(entryPrice, direction, confluence);
+    
+    // Adaptive take profit
+    double takeProfit = CalculateAdaptiveTakeProfit(entryPrice, direction, stopLoss, confluence);
+    
+    if(direction == 1)
+    {
+        if(trade.Buy(lotSize, TradingSymbol, 0, stopLoss, takeProfit, "TimeVortex_Buy"))
+        {
+            currentTicket = trade.ResultOrder();
+            currentDirection = "BUY";
+            Print("TIME VORTEX BUY | Confluence: ", DoubleToString(confluence, 3), 
+                  " | SL: ", DoubleToString(stopLoss, 2), " | TP: ", DoubleToString(takeProfit, 2));
+        }
+    }
+    else
+    {
+        if(trade.Sell(lotSize, TradingSymbol, 0, stopLoss, takeProfit, "TimeVortex_Sell"))
+        {
+            currentTicket = trade.ResultOrder();
+            currentDirection = "SELL";
+            Print("TIME VORTEX SELL | Confluence: ", DoubleToString(confluence, 3),
+                  " | SL: ", DoubleToString(stopLoss, 2), " | TP: ", DoubleToString(takeProfit, 2));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate adaptive position size                               |
+//+------------------------------------------------------------------+
+double CalculateAda
