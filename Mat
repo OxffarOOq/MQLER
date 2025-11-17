@@ -1,0 +1,602 @@
+//+------------------------------------------------------------------+
+//|                                              ChronosEA_XAU_Pro   |
+//|                 XAUUSD Single Trade Manager with Smart Exits     |
+//|                        Discipline + Sentiment-Based Management   |
+//+------------------------------------------------------------------+
+#property copyright "CHRONOS - XAUUSD Discipline"
+#property version   "4.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- XAUUSD Configuration
+input string   TradingSymbol       = "XAUUSD";
+input int      HistoryBars         = 2000;
+input int      SwingPeriod         = 3;
+input double   BaseLotSize         = 0.01;
+input int      AnalysisInterval    = 5;
+input bool     EnableTrading       = true;
+input bool     EnableAlerts        = true;
+input double   MaxRiskPercent      = 1.0;
+
+//--- Trading Discipline
+input bool     SingleTradeMode     = true;        // One trade at a time
+input int      MinBarsBetweenTrades= 3;           // Minimum bars between trades
+input double   MaxDrawdownPercent  = 2.0;         // Max loss before stop trading
+input int      MaxTradesPerHour    = 6;           // Limit trade frequency
+input bool     UseSentimentExits   = true;        // Close losing trades on sentiment
+input double   SentimentExitThreshold = -2.0;     // Confidence to exit losing trade
+
+//--- Algorithm Parameters
+input int      AR_Order            = 4;
+input int      MA_Order            = 2;
+input int      FFTSamples          = 512;
+input double   GARCH_Alpha         = 0.08;
+input double   GARCH_Beta          = 0.88;
+
+//--- Global Variables
+CTrade         trade;
+int            currentTicket = 0;
+string         currentDirection = "";
+datetime       lastTradeTime = 0;
+int            tradesThisHour = 0;
+datetime       hourStartTime = 0;
+double         sessionStartBalance = 0;
+bool           tradingEnabled = true;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    trade.SetExpertMagicNumber(2024);
+    trade.SetDeviationInPoints(20);
+    EventSetTimer(AnalysisInterval);
+    
+    sessionStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    hourStartTime = TimeCurrent();
+    
+    Print("=== XAUUSD DISCIPLINED TRADER INITIALIZED ===");
+    Print("Single Trade Mode: ACTIVE");
+    Print("Sentiment Exits: ", UseSentimentExits);
+    Print("Max Trades/Hour: ", MaxTradesPerHour);
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    EventKillTimer();
+    Print("XAUUSD Disciplined Trader Stopped");
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - Main control loop                               |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    // Check hourly reset
+    if(TimeCurrent() - hourStartTime >= 3600)
+    {
+        tradesThisHour = 0;
+        hourStartTime = TimeCurrent();
+    }
+    
+    // Check drawdown limits
+    if(!CheckDrawdownLimits())
+    {
+        if(tradingEnabled)
+        {
+            tradingEnabled = false;
+            Print("!!! TRADING DISABLED - Max drawdown reached !!!");
+        }
+        return;
+    }
+    
+    // Manage existing trade
+    if(currentTicket > 0)
+    {
+        if(!ManageExistingTrade())
+        {
+            // Trade was closed, reset
+            currentTicket = 0;
+            currentDirection = "";
+        }
+    }
+    
+    // Check for new trade opportunity
+    if(tradingEnabled && currentTicket == 0 && tradesThisHour < MaxTradesPerHour)
+    {
+        CheckForNewTrade();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check drawdown limits                                           |
+//+------------------------------------------------------------------+
+bool CheckDrawdownLimits()
+{
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double drawdownPercent = ((sessionStartBalance - currentBalance) / sessionStartBalance) * 100.0;
+    
+    if(drawdownPercent >= MaxDrawdownPercent)
+    {
+        Print("Drawdown Limit Hit: ", DoubleToString(drawdownPercent, 2), "%");
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing trade with sentiment-based exits                |
+//+------------------------------------------------------------------+
+bool ManageExistingTrade()
+{
+    if(!PositionSelectByTicket(currentTicket))
+    {
+        Print("Position not found, ticket: ", currentTicket);
+        return false;
+    }
+    
+    double currentProfit = PositionGetDouble(POSITION_PROFIT);
+    string posType = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL";
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+    
+    // Get current market sentiment
+    double sentiment = GetCurrentSentiment();
+    
+    // Sentiment-based exit for losing trades
+    if(UseSentimentExits && currentProfit < 0)
+    {
+        bool sentimentAgainstUs = false;
+        
+        if(posType == "BUY" && sentiment < SentimentExitThreshold)
+        {
+            sentimentAgainstUs = true;
+            Print("Sentiment Exit: BUY trade, sentiment too bearish: ", DoubleToString(sentiment, 2));
+        }
+        else if(posType == "SELL" && sentiment > -SentimentExitThreshold)
+        {
+            sentimentAgainstUs = true;
+            Print("Sentiment Exit: SELL trade, sentiment too bullish: ", DoubleToString(sentiment, 2));
+        }
+        
+        if(sentimentAgainstUs)
+        {
+            if(trade.PositionClose(currentTicket))
+            {
+                Print("SENTIMENT EXIT: Closed ", posType, " trade | Loss: ", DoubleToString(currentProfit, 2));
+                return false;
+            }
+        }
+    }
+    
+    // Time-based exit check (if trade is older than 1 hour)
+    datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+    if(TimeCurrent() - openTime > 3600 && MathAbs(currentProfit) < 2.0) // Small profit/loss after 1 hour
+    {
+        if(trade.PositionClose(currentTicket))
+        {
+            Print("TIME EXIT: Closed ", posType, " trade after 1 hour | P/L: ", DoubleToString(currentProfit, 2));
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get current market sentiment                                    |
+//+------------------------------------------------------------------+
+double GetCurrentSentiment()
+{
+    MqlRates rates[];
+    if(!LoadSymbolData(TradingSymbol, PERIOD_M1, HistoryBars, rates))
+        return 0;
+    
+    MultiAlgorithmResult result = RunMultiAlgorithmAnalysis(rates);
+    return result.combinedScore;
+}
+
+//+------------------------------------------------------------------+
+//| Check for new trade with confirmation                           |
+//+------------------------------------------------------------------+
+void CheckForNewTrade()
+{
+    // Check minimum time between trades
+    if(TimeCurrent() - lastTradeTime < MinBarsBetweenTrades * PeriodSeconds(PERIOD_M1))
+        return;
+    
+    MqlRates rates[];
+    if(!LoadSymbolData(TradingSymbol, PERIOD_M1, HistoryBars, rates))
+        return;
+    
+    MultiAlgorithmResult result = RunMultiAlgorithmAnalysis(rates);
+    TradingSignal signal = GenerateTradingSignal(result);
+    
+    // Require strong confirmation for new trades
+    if(signal.confidence >= 4.0 && signal.direction != "HOLD")
+    {
+        if(ConfirmTradeSignal(signal, rates))
+        {
+            ExecuteDisciplinedTrade(signal);
+            lastTradeTime = TimeCurrent();
+            tradesThisHour++;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Confirm trade signal with additional checks                     |
+//+------------------------------------------------------------------+
+bool ConfirmTradeSignal(TradingSignal &signal, MqlRates &rates[])
+{
+    int totalBars = ArraySize(rates);
+    
+    // Check if we're at a swing point
+    bool atSwing = IsAtSwingPoint(rates, totalBars-1);
+    
+    // Check volatility is appropriate
+    double volatility = CalculateVolatility(rates);
+    if(volatility < 0.0005 || volatility > 0.005)
+    {
+        Print("Volatility out of range: ", DoubleToString(volatility, 6));
+        return false;
+    }
+    
+    // Check time alignment (avoid trading during low liquidity)
+    MqlDateTime currentTime;
+    TimeToStruct(rates[totalBars-1].time, currentTime);
+    int currentHour = currentTime.hour;
+    
+    // Prefer trading during active sessions
+    bool goodTradingTime = (currentHour >= 7 && currentHour <= 16) || (currentHour >= 19 && currentHour <= 23);
+    
+    Print("Trade Confirmation - Swing: ", atSwing, " | Volatility: ", DoubleToString(volatility, 6), " | Good Time: ", goodTradingTime);
+    
+    return atSwing && goodTradingTime;
+}
+
+//+------------------------------------------------------------------+
+//| Check if current bar is at a swing point                        |
+//+------------------------------------------------------------------+
+bool IsAtSwingPoint(MqlRates &rates[], int currentIndex)
+{
+    if(currentIndex < SwingPeriod || currentIndex >= ArraySize(rates) - SwingPeriod)
+        return false;
+    
+    double currentHigh = rates[currentIndex].high;
+    double currentLow = rates[currentIndex].low;
+    
+    // Check for local high
+    bool isLocalHigh = true;
+    bool isLocalLow = true;
+    
+    for(int i = currentIndex - SwingPeriod; i <= currentIndex + SwingPeriod; i++)
+    {
+        if(i == currentIndex) continue;
+        
+        if(rates[i].high >= currentHigh)
+            isLocalHigh = false;
+            
+        if(rates[i].low <= currentLow)
+            isLocalLow = false;
+    }
+    
+    return isLocalHigh || isLocalLow;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate current volatility                                   |
+//+------------------------------------------------------------------+
+double CalculateVolatility(MqlRates &rates[])
+{
+    int totalBars = ArraySize(rates);
+    int lookback = MathMin(20, totalBars);
+    
+    double sumRange = 0;
+    for(int i = totalBars - lookback; i < totalBars; i++)
+    {
+        sumRange += (rates[i].high - rates[i].low) / rates[i].close;
+    }
+    
+    return sumRange / lookback;
+}
+
+//+------------------------------------------------------------------+
+//| Execute disciplined trade with proper risk management          |
+//+------------------------------------------------------------------+
+void ExecuteDisciplinedTrade(TradingSignal &signal)
+{
+    double lotSize = CalculateLotSize();
+    
+    if(signal.direction == "BUY")
+    {
+        if(trade.Buy(lotSize, TradingSymbol, 0, 0, 0, "XAU-DISC"))
+        {
+            currentTicket = trade.ResultOrder();
+            currentDirection = "BUY";
+            Print("DISCIPLINED BUY | Ticket: ", currentTicket, " | Lot: ", DoubleToString(lotSize, 2));
+        }
+    }
+    else if(signal.direction == "SELL")
+    {
+        if(trade.Sell(lotSize, TradingSymbol, 0, 0, 0, "XAU-DISC"))
+        {
+            currentTicket = trade.ResultOrder();
+            currentDirection = "SELL";
+            Print("DISCIPLINED SELL | Ticket: ", currentTicket, " | Lot: ", DoubleToString(lotSize, 2));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size with discipline                             |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmount = accountBalance * (MaxRiskPercent / 100.0);
+    
+    // Fixed lot size based on balance
+    if(accountBalance < 1000)
+        return 0.01;
+    else if(accountBalance < 5000)
+        return 0.02;
+    else
+        return 0.03;
+}
+
+//+------------------------------------------------------------------+
+//| Multi-Algorithm Analysis Structure                              |
+//+------------------------------------------------------------------+
+struct MultiAlgorithmResult
+{
+    double      arimaForecast;
+    double      garchVolatility;
+    double      fftDominantPeriod;
+    double      kalmanFilter;
+    double      waveletTrend;
+    double      vortexEnergy;
+    double      gannPressure;
+    double      fractalBias;
+    double      combinedScore;
+    string      marketRegime;
+};
+
+//+------------------------------------------------------------------+
+//| Trading Signal Structure                                        |
+//+------------------------------------------------------------------+
+struct TradingSignal
+{
+    string      direction;
+    double      confidence;
+};
+
+//+------------------------------------------------------------------+
+//| Run multi-algorithm analysis                                    |
+//+------------------------------------------------------------------+
+MultiAlgorithmResult RunMultiAlgorithmAnalysis(MqlRates &rates[])
+{
+    MultiAlgorithmResult result;
+    int totalBars = ArraySize(rates);
+    
+    double prices[];
+    ArrayResize(prices, totalBars);
+    for(int i = 0; i < totalBars; i++)
+        prices[i] = rates[i].close;
+    
+    result.arimaForecast = CalculateARIMA(prices);
+    result.garchVolatility = CalculateGARCH(prices);
+    result.fftDominantPeriod = CalculateFFT(prices);
+    result.kalmanFilter = CalculateKalman(prices);
+    result.waveletTrend = CalculateWavelet(prices);
+    result.vortexEnergy = CalculateVortex(rates);
+    result.gannPressure = CalculateGann(rates);
+    result.fractalBias = CalculateFractalBias(rates);
+    result.marketRegime = DetectMarketRegime(result);
+    result.combinedScore = CalculateCombinedScore(result);
+    
+    return result;
+}
+
+//+------------------------------------------------------------------+
+//| ARIMA Forecasting                                               |
+//+------------------------------------------------------------------+
+double CalculateARIMA(double &prices[])
+{
+    int n = ArraySize(prices);
+    if(n < 10) return prices[n-1];
+    
+    double sum = 0;
+    double weightSum = 0;
+    
+    for(int i = 1; i <= MathMin(5, n-1); i++)
+    {
+        double weight = 1.0 / (i * i);
+        sum += prices[n - i] * weight;
+        weightSum += weight;
+    }
+    
+    return (weightSum > 0) ? sum / weightSum : prices[n-1];
+}
+
+//+------------------------------------------------------------------+
+//| GARCH Volatility                                                |
+//+------------------------------------------------------------------+
+double CalculateGARCH(double &prices[])
+{
+    int n = ArraySize(prices);
+    if(n < 5) return 0.001;
+    
+    double returns[];
+    ArrayResize(returns, n-1);
+    
+    for(int i = 1; i < n; i++)
+    {
+        returns[i-1] = (prices[i] - prices[i-1]) / prices[i-1];
+    }
+    
+    double variance = 0;
+    int returnsCount = ArraySize(returns);
+    for(int i = 0; i < returnsCount; i++)
+    {
+        variance += returns[i] * returns[i];
+    }
+    variance /= returnsCount;
+    
+    return MathSqrt(variance);
+}
+
+//+------------------------------------------------------------------+
+//| FFT Frequency Analysis                                          |
+//+------------------------------------------------------------------+
+double CalculateFFT(double &prices[])
+{
+    return SimpleAutocorrelation(prices);
+}
+
+//+------------------------------------------------------------------+
+//| Simple Autocorrelation                                          |
+//+------------------------------------------------------------------+
+double SimpleAutocorrelation(double &prices[])
+{
+    int n = ArraySize(prices);
+    double maxCorrelation = 0;
+    int dominantPeriod = 10;
+    
+    for(int period = 5; period < 30; period++)
+    {
+        double correlation = 0;
+        int count = 0;
+        
+        for(int i = period; i < MathMin(n, 100); i++)
+        {
+            correlation += (prices[i] - prices[i-period]) * (prices[i] - prices[i-period]);
+            count++;
+        }
+        
+        if(count > 0)
+        {
+            correlation = MathAbs(correlation / count);
+            if(correlation > maxCorrelation)
+            {
+                maxCorrelation = correlation;
+                dominantPeriod = period;
+            }
+        }
+    }
+    
+    return dominantPeriod;
+}
+
+//+------------------------------------------------------------------+
+//| Kalman Filter                                                   |
+//+------------------------------------------------------------------+
+double CalculateKalman(double &prices[])
+{
+    int n = ArraySize(prices);
+    if(n < 3) return prices[0];
+    
+    double state = prices[0];
+    double covariance = 1.0;
+    double q = 0.0001;
+    double r = 0.001;
+    
+    for(int i = 1; i < n; i++)
+    {
+        covariance += q;
+        double kalmanGain = covariance / (covariance + r);
+        state += kalmanGain * (prices[i] - state);
+        covariance *= (1 - kalmanGain);
+    }
+    
+    return state;
+}
+
+//+------------------------------------------------------------------+
+//| Wavelet Analysis                                                |
+//+------------------------------------------------------------------+
+double CalculateWavelet(double &prices[])
+{
+    int n = ArraySize(prices);
+    if(n < 6) return 0;
+    
+    double trend = 0;
+    int levels = MathMin(2, (int)(MathLog(n) / MathLog(2)));
+    
+    for(int level = 0; level < levels; level++)
+    {
+        int step = (int)MathPow(2, level);
+        double sum = 0;
+        int count = 0;
+        
+        for(int i = step; i < MathMin(n, 50); i += step)
+        {
+            sum += prices[i] - prices[i-step];
+            count++;
+        }
+        
+        if(count > 0)
+            trend += sum / count;
+    }
+    
+    return (levels > 0) ? trend / levels : 0;
+}
+
+//+------------------------------------------------------------------+
+//| Vortex Math Analysis                                            |
+//+------------------------------------------------------------------+
+double CalculateVortex(MqlRates &rates[])
+{
+    int swings[];
+    DetectSwings(rates, swings);
+    
+    int swingCount = ArraySize(swings);
+    if(swingCount < 2) return 0;
+    
+    double energy = 0;
+    for(int i = 1; i < swingCount; i++)
+    {
+        int period = swings[i] - swings[i-1];
+        double angle = (period % 6) * M_PI / 3.0;
+        energy += MathSin(angle) + MathCos(angle);
+    }
+    
+    return energy / MathMax(1, swingCount-1);
+}
+
+//+------------------------------------------------------------------+
+//| Gann Analysis                                                   |
+//+------------------------------------------------------------------+
+double CalculateGann(MqlRates &rates[])
+{
+    int n = ArraySize(rates);
+    if(n < 720) return 0;
+    
+    MqlDateTime currentTimeStruct;
+    TimeToStruct(rates[n-1].time, currentTimeStruct);
+    
+    int minuteOfDay = currentTimeStruct.min + currentTimeStruct.hour * 60;
+    double angle = (minuteOfDay % 1440) * 2.0 * M_PI / 1440.0;
+    
+    return MathCos(angle) + MathSin(angle * 2.0);
+}
+
+//+------------------------------------------------------------------+
+//| Fractal Bias Analysis                                           |
+//+------------------------------------------------------------------+
+double CalculateFractalBias(MqlRates &rates[])
+{
+    int highs[], lows[];
+    DetectFractals(rates, highs, lows);
+    
+    int highCount = ArraySize(highs);
+    int lowCount = ArraySize(lows);
+    
+    if(highCount + lowCoun
