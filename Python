@@ -1,0 +1,482 @@
+"""
+advanced_sonic_swing_analyzer.py
+
+Transforms raw price action into a structured sonic framework by integrating
+swing geometry, temporal dynamics, and energy flow patterns.
+
+Features implemented:
+ - Quantum Swing Identification Protocol (multi-timeframe zigzag, momentum filters)
+ - Swing velocity and hierarchy via fractal energy scoring
+ - Harmonic Ratio Matrix Analysis (maps retracements to musical intervals)
+ - Enneagram Energy Flow Mapping (9-point energy model)
+ - Temporal Rhythm Analysis (Fibonacci time clusters, durations, acceleration)
+ - Outputs: Sonic Swing Profile + Harmonic Convergence Dashboard (JSON + optional plots)
+
+Input: pandas.DataFrame with at least ['datetime','open','high','low','close','volume']
+
+Usage:
+  analyzer = AdvancedSonicSwingAnalyzer()
+  profile = analyzer.analyze(df, symbol='XAUUSD')
+  analyzer.save_profile(profile, 'XAUUSD_sonic_profile.json')
+
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Tuple, Optional
+from datetime import datetime
+import json
+import math
+
+# plotting (optional) - only import if available
+try:
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+
+
+@dataclass
+class SwingPoint:
+    idx: int
+    time: pd.Timestamp
+    price: float
+    swing_type: str  # 'high' or 'low'
+    volume: float
+    velocity: float = 0.0
+    fractal_energy: float = 0.0
+
+
+class AdvancedSonicSwingAnalyzer:
+    def __init__(self,
+                 zigzag_pct: float = 0.5,  # adaptive percent threshold (default 0.5%)
+                 min_bars: int = 3,
+                 multi_tf_windows: List[int] = [1, 3, 5],
+                 momentum_fast: int = 5,
+                 momentum_slow: int = 34,
+                 verbose: bool = False):
+        self.zigzag_pct = zigzag_pct
+        self.min_bars = min_bars
+        self.multi_tf_windows = multi_tf_windows
+        self.momentum_fast = momentum_fast
+        self.momentum_slow = momentum_slow
+        self.verbose = verbose
+
+        # harmonic mapping (retracement -> label)
+        self.retracement_map = {
+            0.382: 'Minor Sixth',
+            0.5: 'Perfect Fourth',
+            0.618: 'Golden Fifth',
+            0.786: 'Major Seventh'
+        }
+
+        # frequency ratios mapping (approx values)
+        self.harmonic_ratios = {
+            'GoldenRatio': 1.618,
+            'Sqrt2': 1.414,
+            'Octave': 2.0,
+            'MajorThird': 1.259
+        }
+
+        # Fibonacci time clusters (bars)
+        self.fib_times = [8, 13, 21, 34, 55]
+
+    # ----------------------------- utilities ---------------------------------
+    def _log(self, *args):
+        if self.verbose:
+            print(*args)
+
+    def _ema(self, series: pd.Series, span: int) -> pd.Series:
+        return series.ewm(span=span, adjust=False).mean()
+
+    # ----------------------- ZigZag & multi-timeframe ------------------------
+    def zigzag(self, prices: pd.Series, pct: float) -> List[Tuple[int, float, str]]:
+        """
+        Simple zigzag: returns list of (index, price, 'high'/'low').
+        pct is percent threshold (e.g., 0.5 => 0.5%).
+        """
+        if len(prices) < 3:
+            return []
+        thr = pct / 100.0
+        last_pivot_idx = 0
+        last_pivot_price = prices.iloc[0]
+        last_pivot_type = None
+        pivots = []
+
+        for i in range(1, len(prices)):
+            p = prices.iloc[i]
+            change = (p - last_pivot_price) / last_pivot_price
+            # detect new pivot
+            if last_pivot_type in (None, 'low'):
+                # looking for high
+                if change >= thr:
+                    last_pivot_type = 'high'
+                    last_pivot_price = p
+                    last_pivot_idx = i
+                    pivots.append((i, float(p), 'high'))
+            else:
+                # looking for low
+                if change <= -thr:
+                    last_pivot_type = 'low'
+                    last_pivot_price = p
+                    last_pivot_idx = i
+                    pivots.append((i, float(p), 'low'))
+        return pivots
+
+    def multi_tf_zigzag(self, df: pd.DataFrame) -> List[SwingPoint]:
+        """
+        Combines zigzag results across different windowed closes (multi-timeframe)
+        to increase robustness. Uses adaptive depth sensitivity via median pivot support.
+        """
+        closes = df['close']
+        all_pivots = []
+        for w in self.multi_tf_windows:
+            # resample via rolling median to simulate higher timeframe smoothing
+            if w > 1:
+                smooth = closes.rolling(window=w, min_periods=1).median().dropna().reset_index(drop=True)
+            else:
+                smooth = closes.reset_index(drop=True)
+            piv = self.zigzag(smooth, self.zigzag_pct)
+            # map pivot idx back to original index approximately
+            mapped = []
+            for idx, price, typ in piv:
+                orig_idx = min(len(closes)-1, int(idx * w)) if w > 1 else idx
+                mapped.append((orig_idx, price, typ))
+            all_pivots.append(mapped)
+
+        # count support per (idx, type) and select those with median support
+        pivot_counts = {}
+        for piv in all_pivots:
+            for idx, price, typ in piv:
+                key = (idx, typ)
+                pivot_counts.setdefault(key, 0)
+                pivot_counts[key] += 1
+        # threshold: appear in at least half of windows
+        threshold = max(1, len(self.multi_tf_windows) // 2)
+        chosen = [k for k,v in pivot_counts.items() if v >= threshold]
+        # sort by idx
+        chosen_sorted = sorted(chosen, key=lambda x: x[0])
+
+        swing_points = []
+        for idx, typ in chosen_sorted:
+            swing_points.append(SwingPoint(idx=idx,
+                                           time=df['datetime'].iloc[idx],
+                                           price=float(df['close'].iloc[idx]),
+                                           swing_type=typ,
+                                           volume=float(df['volume'].iloc[idx])))
+        return swing_points
+
+    # ---------------------- Momentum confirmation --------------------------------
+    def derivative_oscillator(self, series: pd.Series) -> pd.Series:
+        """Derivative oscillator: difference of two EMAs (fast - slow)."""
+        fast = self._ema(series, self.momentum_fast)
+        slow = self._ema(series, self.momentum_slow)
+        return fast - slow
+
+    def volume_profile_signal(self, df: pd.DataFrame, idx: int, window: int = 20) -> float:
+        """
+        Simple volume profile: average volume around idx vs window mean.
+        Returns normalized score >0 indicates above-average volume (supporting swing).
+        """
+        start = max(0, idx - window)
+        end = min(len(df)-1, idx + window)
+        local_avg = df['volume'].iloc[start:end+1].mean()
+        global_avg = df['volume'].mean() if len(df['volume']) else 1.0
+        return float(local_avg / (global_avg + 1e-9))
+
+    # ---------------------- Swing velocity & fractal scoring ------------------------
+    def compute_swing_velocity(self, df: pd.DataFrame, prev_idx: int, curr_idx: int) -> float:
+        if prev_idx is None:
+            return 0.0
+        price_delta = df['close'].iloc[curr_idx] - df['close'].iloc[prev_idx]
+        time_delta = max(1, curr_idx - prev_idx)
+        velocity = price_delta / time_delta
+        return float(velocity)
+
+    def fractal_energy_score(self, df: pd.DataFrame, idx: int, radius: int = 8) -> float:
+        """
+        Fractal energy: compare local range vs neighborhood ranges to get a relative energy.
+        Primary swings have higher energy.
+        """
+        n = len(df)
+        left = max(0, idx - radius)
+        right = min(n-1, idx + radius)
+        local_range = df['high'].iloc[left:right+1].max() - df['low'].iloc[left:right+1].min()
+        # neighborhood ranges in non-overlapping windows
+        window = max(1, radius)
+        ranges = []
+        for start in range(left, right, window):
+            end = min(n-1, start + window)
+            ranges.append(df['high'].iloc[start:end+1].max() - df['low'].iloc[start:end+1].min())
+        avg_neighbor = np.mean(ranges) if ranges else local_range
+        score = float(np.clip(local_range / (avg_neighbor + 1e-9), 0.0, 10.0))
+        # normalize to 0..1 using tanh
+        return float(np.tanh(score/2.0))
+
+    # ---------------------- Harmonic Ratio Matrix -------------------------------
+    def map_retracement_to_interval(self, retracement: float) -> Tuple[str, float]:
+        """Map a retracement fraction to the nearest harmonic label and return label and closeness."""
+        if retracement <= 0:
+            return 'none', 0.0
+        diffs = {k: abs(retracement - k) for k in self.retracement_map.keys()}
+        nearest = min(diffs, key=diffs.get)
+        closeness = 1.0 - (diffs[nearest] / (nearest + 1e-9))
+        return self.retracement_map[nearest], float(np.clip(closeness, 0.0, 1.0))
+
+    # ---------------------- Enneagram energy mapping ---------------------------
+    def map_enneagram(self, swings: List[SwingPoint]) -> Dict:
+        """
+        Map sequence of swings into a 9-point energy system.
+        Heuristics:
+         - Map first 3 swings -> points 1-3 (impulse)
+         - next 3 -> 4-6 (correction)
+         - last 3 -> 7-9 (terminal)
+        Returns current position, predicted next transition and energy states.
+        """
+        n = len(swings)
+        mapping = {}
+        if n == 0:
+            return {'current': None, 'predicted_next': None, 'score': 0.0}
+        # assign indices cyclically
+        points = []
+        for i in range(n):
+            p = ((i) % 9) + 1
+            points.append(p)
+        # energy states
+        def point_state(p):
+            if p in (1,2,3):
+                return 'beginning_impulse'
+            if p in (4,5,6):
+                return 'middle_correction'
+            return 'terminal_impulse'
+
+        current_point = points[-1]
+        current_state = point_state(current_point)
+        # predict next: simple law-of-seven progression (advance by 1, watch for shocks at 3,6,9)
+        next_point = current_point + 1 if current_point < 9 else 1
+        next_state = point_state(next_point)
+        shock = next_point in (3,6,9)
+        # internal triangles heuristic: if pattern shows internal pivot shapes, boost score
+        score = 0.5
+        # increase score if recent velocities indicate acceleration then decel
+        velocities = [s.velocity for s in swings if hasattr(s, 'velocity')]
+        if len(velocities) >= 3:
+            acc = np.mean(np.diff(velocities[-3:]))
+            if acc > 0:
+                score += 0.2
+            else:
+                score -= 0.1
+        score = float(np.clip(score, 0.0, 1.0))
+        return {'current': current_point, 'current_state': current_state,
+                'predicted_next_point': next_point, 'predicted_next_state': next_state,
+                'shock_zone_next': shock, 'score': score}
+
+    # ---------------------- Temporal rhythm analysis --------------------------
+    def temporal_rhythm(self, swings: List[SwingPoint]) -> Dict:
+        if not swings or len(swings) < 2:
+            return {'durations': [], 'fib_clusters': [], 'accel_pattern': 'insufficient'}
+        durations = []
+        for i in range(1, len(swings)):
+            dt = swings[i].idx - swings[i-1].idx
+            durations.append(int(dt))
+        # detect fibonacci clusters
+        clusters = [d for d in durations if d in self.fib_times]
+        # acceleration: check slope of durations
+        if len(durations) >= 3:
+            slope = np.polyfit(np.arange(len(durations)), durations, 1)[0]
+            if slope > 0.5:
+                accel = 'decelerating'  # durations increasing -> slower swings
+            elif slope < -0.5:
+                accel = 'accelerating'
+            else:
+                accel = 'stable'
+        else:
+            accel = 'insufficient'
+        return {'durations': durations, 'fib_clusters': clusters, 'accel_pattern': accel}
+
+    # ---------------------- Combined analysis pipeline ------------------------
+    def analyze(self, df: pd.DataFrame, symbol: str = 'SYMBOL') -> Dict[str, Any]:
+        """
+        Main entry: perform full analysis and return a structured profile dict.
+        """
+        # basic validation
+        required = {'datetime', 'open', 'high', 'low', 'close', 'volume'}
+        if not required.issubset(set(df.columns)):
+            raise ValueError(f"DataFrame must contain columns: {required}")
+        df = df.reset_index(drop=True).copy()
+        # ensure datetime
+        if not np.issubdtype(df['datetime'].dtype, np.datetime64):
+            df['datetime'] = pd.to_datetime(df['datetime'])
+
+        # multi-timeframe zigzag
+        swings = self.multi_tf_zigzag(df)
+        if len(swings) < 3:
+            return {'symbol': symbol, 'error': 'insufficient_swings', 'swings': []}
+
+        # confirm swings with momentum & volume
+        closes = df['close']
+        deriv = self.derivative_oscillator(closes)
+        confirmed = []
+        prev_idx = None
+        for i, sp in enumerate(swings):
+            idx = sp.idx
+            # momentum filter: derivative at idx should align with swing type
+            dval = float(deriv.iloc[idx]) if idx < len(deriv) else 0.0
+            vol_score = self.volume_profile_signal(df, idx)
+            vel = self.compute_swing_velocity(df, prev_idx, idx)
+            sp.velocity = vel
+            sp.fractal_energy = self.fractal_energy_score(df, idx)
+            # acceptance heuristic
+            accept = False
+            if sp.swing_type == 'high' and dval < 0 and vol_score >= 0.7:
+                accept = True
+            if sp.swing_type == 'low' and dval > 0 and vol_score >= 0.7:
+                accept = True
+            # if momentum weak, accept if fractal_energy high
+            if not accept and sp.fractal_energy > 0.7:
+                accept = True
+            if accept:
+                confirmed.append(sp)
+                prev_idx = idx
+
+        if len(confirmed) < 3:
+            # fallback: accept top-3 by fractal energy
+            swings_sorted = sorted(swings, key=lambda s: s.fractal_energy, reverse=True)
+            confirmed = swings_sorted[:max(3, len(swings_sorted))]
+
+        # compute retracements between swings and harmonic labeling
+        harmonic_relations = []
+        for i in range(1, len(confirmed)):
+            prev = confirmed[i-1]
+            curr = confirmed[i]
+            # retracement fraction based on swing amplitude
+            if prev.swing_type == 'low' and curr.swing_type == 'high':
+                amp = curr.price - prev.price
+                # find prior high->low retracement if available
+                retr = 0.0
+            elif prev.swing_type == 'high' and curr.swing_type == 'low':
+                amp = prev.price - curr.price
+                retr = 0.0
+            else:
+                amp = abs(curr.price - prev.price)
+                retr = 0.0
+            # Look back to calculate retracement relative to prior move if possible
+            # naive: use previous amplitude ratio (if available)
+            if i >= 2:
+                prior = confirmed[i-2]
+                prior_amp = abs(prev.price - prior.price)
+                retr = amp / (prior_amp + 1e-9)
+            label, closeness = self.map_retracement_to_interval(round(retr,3)) if retr>0 else ('none',0.0)
+            harmonic_relations.append({
+                'from_idx': prev.idx, 'to_idx': curr.idx,
+                'from_price': prev.price, 'to_price': curr.price,
+                'movement': f"{prev.swing_type}->{curr.swing_type}",
+                'amplitude': amp,
+                'retracement': retr,
+                'harmonic_label': label,
+                'label_closeness': closeness,
+                'velocity': curr.velocity,
+                'fractal_energy': curr.fractal_energy
+            })
+
+        # Enneagram mapping
+        enneagram = self.map_enneagram(confirmed)
+
+        # temporal rhythm
+        temporal = self.temporal_rhythm(confirmed)
+
+        # energy state classification heuristic
+        avg_energy = float(np.mean([c.fractal_energy for c in confirmed]))
+        if avg_energy > 0.7:
+            energy_state = 'Expansion'
+        elif avg_energy > 0.4:
+            energy_state = 'Accumulation'
+        else:
+            energy_state = 'Distribution'
+
+        # Sonic Swing Profile
+        primary = harmonic_relations[-1] if harmonic_relations else None
+        direction = primary['movement'] if primary else 'unknown'
+        harmonic_label = primary['harmonic_label'] if primary else 'none'
+
+        sonic_profile = {
+            'symbol': symbol,
+            'analysis_time': datetime.utcnow().isoformat() + 'Z',
+            'primary_structure': {
+                'movement': direction,
+                'harmonic_label': harmonic_label,
+                'amplitude': primary['amplitude'] if primary else 0.0,
+                'velocity': primary['velocity'] if primary else 0.0,
+                'fractal_energy': primary['fractal_energy'] if primary else 0.0
+            },
+            'energy_state': energy_state,
+            'enneagram': enneagram,
+            'temporal': temporal,
+            'harmonic_relations': harmonic_relations,
+            'confirmed_swings': [asdict(s) for s in confirmed]
+        }
+
+        # Harmonic convergence dashboard (summary)
+        convergence = {
+            'n_confirmed_swings': len(confirmed),
+            'avg_velocity': float(np.mean([abs(s.velocity) for s in confirmed])) if confirmed else 0.0,
+            'avg_fractal_energy': avg_energy,
+            'fib_time_hits': temporal['fib_clusters'],
+            'next_enneagram': {
+                'point': enneagram.get('predicted_next_point'),
+                'state': enneagram.get('predicted_next_state'),
+                'shock_zone_next': enneagram.get('shock_zone_next')
+            }
+        }
+
+        profile = {'sonic_profile': sonic_profile, 'convergence_dashboard': convergence}
+        return profile
+
+    # ---------------------- Output helpers ----------------------------------
+    def save_profile(self, profile: Dict[str, Any], path: str):
+        with open(path, 'w') as f:
+            json.dump(profile, f, indent=2, default=str)
+        self._log(f"Saved sonic profile to {path}")
+
+    def plot_profile(self, df: pd.DataFrame, profile: Dict[str, Any]):
+        if not HAS_MPL:
+            raise RuntimeError('matplotlib not available')
+        sonic = profile['sonic_profile']
+        swings = sonic['confirmed_swings']
+        times = df['datetime']
+        closes = df['close']
+        plt.figure(figsize=(12,6))
+        plt.plot(times, closes, label='close')
+        for s in swings:
+            t = df.loc[s['idx'],'datetime']
+            p = s['price']
+            marker = 'v' if s['swing_type']=='high' else '^'
+            plt.scatter(t, p, marker=marker, s=80, label=f"s{s['idx']} {s['swing_type']}")
+        plt.legend()
+        plt.title(f"Sonic Swing Profile - {sonic['symbol']}")
+        plt.show()
+
+
+# ------------------------ CLI example ---------------------------------------
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Advanced Sonic Swing Analyzer')
+    parser.add_argument('--input', '-i', required=True, help='CSV file with datetime,open,high,low,close,volume')
+    parser.add_argument('--symbol', '-s', default='SYMBOL')
+    parser.add_argument('--output', '-o', default=None)
+    parser.add_argument('--plot', action='store_true')
+    args = parser.parse_args()
+
+    df = pd.read_csv(args.input)
+    # try parse datetime
+    try:
+        df['datetime'] = pd.to_datetime(df['datetime'])
+    except Exception:
+        pass
+
+    analyzer = AdvancedSonicSwingAnalyzer(verbose=True)
+    profile = analyzer.analyze(df, symbol=args.symbol)
+
+    if args.output:
+        analyzer.save_profile(profil
